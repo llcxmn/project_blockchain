@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Attendance Logger (Lokal)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin:24px; max-width:900px }
+    h1 { margin:0 0 6px }
+    .muted { color:#666; font-size:12px }
+    .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin:12px 0 }
+    label { display:block; font-weight:600; margin:8px 0 4px }
+    input, select, button { padding:10px; border-radius:8px; border:1px solid #ccc; width:100% }
+    button { cursor:pointer }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px }
+    table { width:100%; border-collapse:collapse; margin-top:12px }
+    th, td { border:1px solid #eee; padding:10px; text-align:left; font-size:14px }
+    th { background:#fafafa }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #ddd; font-size:12px }
+  </style>
+</head>
+<body>
+  <h1>Attendance Logger (Lokal)</h1>
+  <p class="muted">Buka via http://127.0.0.1:8080 • Hardhat node (chainId 31337) • MetaMask jaringan localhost:8545.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Alamat Kontrak</label>
+        <input id="contractAddress" placeholder="0x... (isi alamat hasil deploy)" />
+      </div>
+      <div>
+        <label>Info</label>
+        <input value="RPC: http://127.0.0.1:8545 | ChainId: 31337" readonly />
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnConnect">🔌 Connect Wallet</button>
+      <button id="btnLoad">🔄 Cek Total</button>
+    </div>
+    <p id="txStatus" class="muted"></p>
+  </div>
+
+  <div class="card">
+    <h3>Catat Kehadiran</h3>
+    <label>Nama</label>
+    <input id="nama" placeholder="mis. Budi" />
+    <label>Status</label>
+    <select id="status">
+      <option value="0">Hadir</option>
+      <option value="1">TidakHadir</option>
+    </select>
+    <div class="row" style="margin-top:8px">
+      <button id="btnSubmit">📝 Simpan</button>
+      <button id="btnBatch">📚 Ambil Batch (1..20)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Riwayat</h3>
+    <table>
+      <thead><tr><th>ID</th><th>Nama</th><th>Waktu</th><th>Status</th><th>Pencatat</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <!-- 1) MUAT UMD BUILD (global window.ethers). Pastikan file ini ada. -->
+  <script src="/vendor/ethers.umd.min.js"></script>
+
+  <!-- 2) APP SCRIPT -->
+  <script>
+    if (!window.ethers) {
+      alert("Ethers gagal dimuat. Pastikan /vendor/ethers.umd.min.js ada dan server http berjalan.");
+    }
+
+    const ABI = [
+      {"inputs":[{"internalType":"string","name":"_nama","type":"string"},{"internalType":"uint8","name":"_status","type":"uint8"}],"name":"logAttendance","outputs":[],"stateMutability":"nonpayable","type":"function"},
+      {"inputs":[{"internalType":"uint256","name":"startId","type":"uint256"},{"internalType":"uint256","name":"count","type":"uint256"}],"name":"getBatch","outputs":[{"components":[{"internalType":"uint256","name":"id","type":"uint256"},{"internalType":"string","name":"nama","type":"string"},{"internalType":"uint256","name":"waktu","type":"uint256"},{"internalType":"uint8","name":"status","type":"uint8"},{"internalType":"address","name":"pencatat","type":"address"}],"internalType":"struct AttendanceLogger.Record[]","name":"out","type":"tuple[]"}],"stateMutability":"view","type":"function"},
+      {"inputs":[],"name":"total","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+      {"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"id","type":"uint256"},{"indexed":false,"internalType":"string","name":"nama","type":"string"},{"indexed":false,"internalType":"uint256","name":"waktu","type":"uint256"},{"indexed":false,"internalType":"uint8","name":"status","type":"uint8"},{"indexed":true,"internalType":"address","name":"pencatat","type":"address"}],"name":"AttendanceLogged","type":"event"}
+    ];
+
+    const $ = (id) => document.getElementById(id);
+    const fmt = (t) => new Date(Number(t)*1000).toLocaleString();
+    const RPC_URL = "http://127.0.0.1:8545";             // langsung ke Hardhat node
+    let rpcProv = new ethers.JsonRpcProvider(RPC_URL);    // READ-ONLY
+    let browserProv, signer, contract;
+
+function getInjectedProvider() {
+  const eth = window.ethereum;
+  if (!eth) return null;
+  if (Array.isArray(eth.providers)) {
+    const mm = eth.providers.find(p => p.isMetaMask);
+    return mm || eth.providers[0];
+  }
+  return eth;
+}
+
+const isAddr = (a) => /^0x[0-9a-fA-F]{40}$/.test(a);
+
+async function ensureCode(addr) {
+  if (!isAddr(addr)) throw new Error("Alamat kontrak tidak valid (0x + 40 hex).");
+  const code = await rpcProv.getCode(addr);           // <- PAKAI RPC LANGSUNG, BUKAN METAMASK
+  if (!code || code === "0x") throw new Error("Tidak ada bytecode di alamat ini (deploy ulang & pakai alamat baru).");
+}
+
+async function connect() {
+  const injected = getInjectedProvider();
+  if (!injected) return alert("MetaMask tidak terdeteksi.");
+
+  // pakai MetaMask hanya untuk SIGN
+  browserProv = new ethers.BrowserProvider(injected);
+  await browserProv.send("eth_requestAccounts", []);
+  signer = await browserProv.getSigner();
+
+  const addr = document.getElementById("contractAddress").value.trim();
+  await ensureCode(addr);                              // cek ke node lokal
+
+  contract = new ethers.Contract(addr, ABI, signer);   // signer dari MetaMask (untuk write)
+  const nw = await browserProv.getNetwork();
+  document.getElementById("txStatus").textContent =
+    `Connected: ${await signer.getAddress()} | chainId ${nw.chainId}`;
+}
+
+async function checkTotal() {
+  try {
+    const addr = document.getElementById("contractAddress").value.trim();
+    await ensureCode(addr);                            // cek bytecode via rpcProv
+    const read = new ethers.Contract(addr, ABI, rpcProv);  // READ via RPC langsung
+    const tot = await read.total();
+    document.getElementById("txStatus").textContent = `Total record: ${tot.toString()}`;
+  } catch (e) {
+    document.getElementById("txStatus").textContent = "Gagal cek total: " + (e.shortMessage || e.message || e);
+  }
+}
+
+async function submit() {
+  try {
+    if (!contract) return alert("Connect Wallet dulu.");
+    const nama = document.getElementById("nama").value.trim();
+    const status = Number(document.getElementById("status").value);
+    if (!nama) return alert("Nama wajib diisi.");
+    document.getElementById("txStatus").textContent = "Mengirim transaksi...";
+    const tx = await contract.logAttendance(nama, status); // WRITE via MetaMask signer
+    document.getElementById("txStatus").textContent = "TX: " + tx.hash + " (waiting...)";
+    const rc = await tx.wait();
+    document.getElementById("txStatus").textContent = "Mined in block " + rc.blockNumber;
+
+    // opsional: refresh total via rpc
+    try {
+      const read = new ethers.Contract(contract.target, ABI, rpcProv);
+      const tot = await read.total();
+      document.getElementById("txStatus").textContent += ` | Total: ${tot.toString()}`;
+    } catch {}
+  } catch (e) {
+    document.getElementById("txStatus").textContent = "Gagal: " + (e.shortMessage || e.message || e);
+  }
+}
+
+async function loadBatch() {
+  try {
+    if (!contract) return alert("Connect Wallet dulu.");
+    await ensureCode(contract.target);
+    const read = new ethers.Contract(contract.target, ABI, rpcProv);
+    const data = await read.getBatch(1, 20);          // READ via RPC langsung
+    renderRows(data);
+    document.getElementById("txStatus").textContent = "Muat batch OK.";
+  } catch (e) {
+    document.getElementById("txStatus").textContent = "Gagal muat: " + (e.shortMessage || e.message || e);
+  }
+}
+
+
+    $("btnConnect").onclick = connect;
+    $("btnLoad").onclick = checkTotal;
+    $("btnSubmit").onclick = submit;
+    $("btnBatch").onclick = loadBatch;
+  </script>
+</body>
+</html>
