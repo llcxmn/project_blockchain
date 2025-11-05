@@ -17,25 +17,27 @@
     th, td { border:1px solid #eee; padding:10px; text-align:left; font-size:14px }
     th { background:#fafafa }
     .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #ddd; font-size:12px }
+    .row-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px }
   </style>
 </head>
 <body>
   <h1>Attendance Logger (Lokal)</h1>
-  <p class="muted">Buka via http://127.0.0.1:8080 • Hardhat node (chainId 31337) • MetaMask jaringan localhost:8545.</p>
+  <p class="muted">Buka via http://127.0.0.1:8080 • Hardhat node (ChainId 31337) • MetaMask jaringan localhost:8545.</p>
 
   <div class="card">
     <div class="row">
       <div>
         <label>Alamat Kontrak</label>
-        <input id="contractAddress" placeholder="0x... (isi alamat hasil deploy)" />
+        <input id="contractAddress" placeholder="0x... (alamat hasil deploy TERBARU)" />
       </div>
       <div>
         <label>Info</label>
         <input value="RPC: http://127.0.0.1:8545 | ChainId: 31337" readonly />
       </div>
     </div>
-    <div class="row" style="margin-top:8px">
+    <div class="row-3" style="margin-top:8px">
       <button id="btnConnect">🔌 Connect Wallet</button>
+      <button id="btnChoose">🔄 Pilih Ulang Akun</button>
       <button id="btnLoad">🔄 Cek Total</button>
     </div>
     <p id="txStatus" class="muted"></p>
@@ -64,114 +66,141 @@
     </table>
   </div>
 
-  <!-- 1) MUAT UMD BUILD (global window.ethers). Pastikan file ini ada. -->
+  <!-- Ethers UMD (global window.ethers) -->
   <script src="/vendor/ethers.umd.min.js"></script>
 
-  <!-- 2) APP SCRIPT -->
   <script>
-    if (!window.ethers) {
-      alert("Ethers gagal dimuat. Pastikan /vendor/ethers.umd.min.js ada dan server http berjalan.");
-    }
+    if (!window.ethers) alert("Ethers gagal dimuat. Pastikan /vendor/ethers.umd.min.js ada & server http berjalan.");
 
+    // ===== Konstanta & util =====
     const ABI = [
       {"inputs":[{"internalType":"string","name":"_nama","type":"string"},{"internalType":"uint8","name":"_status","type":"uint8"}],"name":"logAttendance","outputs":[],"stateMutability":"nonpayable","type":"function"},
       {"inputs":[{"internalType":"uint256","name":"startId","type":"uint256"},{"internalType":"uint256","name":"count","type":"uint256"}],"name":"getBatch","outputs":[{"components":[{"internalType":"uint256","name":"id","type":"uint256"},{"internalType":"string","name":"nama","type":"string"},{"internalType":"uint256","name":"waktu","type":"uint256"},{"internalType":"uint8","name":"status","type":"uint8"},{"internalType":"address","name":"pencatat","type":"address"}],"internalType":"struct AttendanceLogger.Record[]","name":"out","type":"tuple[]"}],"stateMutability":"view","type":"function"},
       {"inputs":[],"name":"total","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
       {"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"id","type":"uint256"},{"indexed":false,"internalType":"string","name":"nama","type":"string"},{"indexed":false,"internalType":"uint256","name":"waktu","type":"uint256"},{"indexed":false,"internalType":"uint8","name":"status","type":"uint8"},{"indexed":true,"internalType":"address","name":"pencatat","type":"address"}],"name":"AttendanceLogged","type":"event"}
     ];
-
+    const RPC_URL = "http://127.0.0.1:8545";
+    const isAddr = (a) => /^0x[0-9a-fA-F]{40}$/.test(a);
     const $ = (id) => document.getElementById(id);
     const fmt = (t) => new Date(Number(t)*1000).toLocaleString();
-    const RPC_URL = "http://127.0.0.1:8545";             // langsung ke Hardhat node
-    let rpcProv = new ethers.JsonRpcProvider(RPC_URL);    // READ-ONLY
-    let browserProv, signer, contract;
+    const msg = (e) => e?.shortMessage || e?.info?.error?.message || e?.data?.message || e?.message || String(e);
 
-function getInjectedProvider() {
-  const eth = window.ethereum;
-  if (!eth) return null;
-  if (Array.isArray(eth.providers)) {
-    const mm = eth.providers.find(p => p.isMetaMask);
-    return mm || eth.providers[0];
-  }
-  return eth;
-}
+    // ===== Providers & globals (untuk debugging di Console) =====
+    window.rpcProv = new ethers.JsonRpcProvider(RPC_URL); // READ langsung ke node lokal
+    window.browserProv = null; // MetaMask
+    window.signer = null;
+    window.contract = null;
+    window.contractAddr = null;
 
-const isAddr = (a) => /^0x[0-9a-fA-F]{40}$/.test(a);
+    function getInjectedProvider() {
+      const eth = window.ethereum;
+      if (!eth) return null;
+      if (Array.isArray(eth.providers)) {
+        const mm = eth.providers.find(p => p.isMetaMask);
+        return mm || eth.providers[0];
+      }
+      return eth;
+    }
 
-async function ensureCode(addr) {
-  if (!isAddr(addr)) throw new Error("Alamat kontrak tidak valid (0x + 40 hex).");
-  const code = await rpcProv.getCode(addr);           // <- PAKAI RPC LANGSUNG, BUKAN METAMASK
-  if (!code || code === "0x") throw new Error("Tidak ada bytecode di alamat ini (deploy ulang & pakai alamat baru).");
-}
+    async function ensureCode(addr) {
+      if (!isAddr(addr)) throw new Error("Alamat kontrak tidak valid (0x + 40 hex).");
+      const code = await window.rpcProv.getCode(addr);
+      if (!code || code === "0x") throw new Error("Tidak ada bytecode di alamat ini. Deploy ulang & pakai alamat TERBARU.");
+    }
 
-async function connect() {
-  const injected = getInjectedProvider();
-  if (!injected) return alert("MetaMask tidak terdeteksi.");
+    function renderRows(list){
+      const tbody = $("rows"); tbody.innerHTML = "";
+      for (const r of list) {
+        const st = Number(r.status) === 0 ? '<span class="pill">Hadir</span>' : '<span class="pill">TidakHadir</span>';
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${r.id}</td><td>${r.nama}</td><td>${fmt(r.waktu)}</td><td>${st}</td><td class="muted">${r.pencatat}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
 
-  // pakai MetaMask hanya untuk SIGN
-  browserProv = new ethers.BrowserProvider(injected);
-  await browserProv.send("eth_requestAccounts", []);
-  signer = await browserProv.getSigner();
+    async function rebindSignerAndContract() {
+      if (!window.browserProv) return;
+      window.signer = await window.browserProv.getSigner();
+      const addr = window.contract?.target || window.contractAddr || $("contractAddress").value.trim();
+      if (addr && isAddr(addr)) {
+        window.contractAddr = addr;
+        window.contract = new ethers.Contract(addr, ABI, window.signer);
+      }
+      const nw = await window.browserProv.getNetwork();
+      $("txStatus").textContent = `Connected: ${await window.signer.getAddress()} | chainId ${nw.chainId}`;
+    }
 
-  const addr = document.getElementById("contractAddress").value.trim();
-  await ensureCode(addr);                              // cek ke node lokal
+    // ===== Actions =====
+    async function connect() {
+      const injected = getInjectedProvider();
+      if (!injected) return alert("MetaMask tidak terdeteksi.");
+      window.browserProv = new ethers.BrowserProvider(injected);
+      await window.browserProv.send("eth_requestAccounts", []); // pop-up Connect
 
-  contract = new ethers.Contract(addr, ABI, signer);   // signer dari MetaMask (untuk write)
-  const nw = await browserProv.getNetwork();
-  document.getElementById("txStatus").textContent =
-    `Connected: ${await signer.getAddress()} | chainId ${nw.chainId}`;
-}
+      window.contractAddr = $("contractAddress").value.trim();
+      await ensureCode(window.contractAddr);      // pastikan alamat valid di node lokal
+      await rebindSignerAndContract();            // init signer & kontrak
+    }
 
-async function checkTotal() {
-  try {
-    const addr = document.getElementById("contractAddress").value.trim();
-    await ensureCode(addr);                            // cek bytecode via rpcProv
-    const read = new ethers.Contract(addr, ABI, rpcProv);  // READ via RPC langsung
-    const tot = await read.total();
-    document.getElementById("txStatus").textContent = `Total record: ${tot.toString()}`;
-  } catch (e) {
-    document.getElementById("txStatus").textContent = "Gagal cek total: " + (e.shortMessage || e.message || e);
-  }
-}
+    async function chooseAccountAgain() {
+      if (!window.ethereum) return alert("MetaMask tidak terdeteksi.");
+      await window.ethereum.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+      await window.browserProv?.send("eth_requestAccounts", []);
+      await rebindSignerAndContract();            // pakai akun yang baru dipilih
+    }
 
-async function submit() {
-  try {
-    if (!contract) return alert("Connect Wallet dulu.");
-    const nama = document.getElementById("nama").value.trim();
-    const status = Number(document.getElementById("status").value);
-    if (!nama) return alert("Nama wajib diisi.");
-    document.getElementById("txStatus").textContent = "Mengirim transaksi...";
-    const tx = await contract.logAttendance(nama, status); // WRITE via MetaMask signer
-    document.getElementById("txStatus").textContent = "TX: " + tx.hash + " (waiting...)";
-    const rc = await tx.wait();
-    document.getElementById("txStatus").textContent = "Mined in block " + rc.blockNumber;
+    async function checkTotal() {
+      try {
+        const addr = $("contractAddress").value.trim();
+        await ensureCode(addr);
+        const read = new ethers.Contract(addr, ABI, window.rpcProv); // READ via RPC
+        const tot = await read.total();
+        $("txStatus").textContent = `Total record: ${tot.toString()}`;
+      } catch (e) {
+        $("txStatus").textContent = "Gagal cek total: " + msg(e);
+      }
+    }
 
-    // opsional: refresh total via rpc
-    try {
-      const read = new ethers.Contract(contract.target, ABI, rpcProv);
-      const tot = await read.total();
-      document.getElementById("txStatus").textContent += ` | Total: ${tot.toString()}`;
-    } catch {}
-  } catch (e) {
-    document.getElementById("txStatus").textContent = "Gagal: " + (e.shortMessage || e.message || e);
-  }
-}
+    async function submit() {
+      try {
+        if (!window.contract) return alert("Connect Wallet dulu.");
+        await rebindSignerAndContract();          // pastikan signer = akun aktif
+        const nama = $("nama").value.trim();
+        const status = Number($("status").value);
+        if (!nama) return alert("Nama wajib diisi.");
 
-async function loadBatch() {
-  try {
-    if (!contract) return alert("Connect Wallet dulu.");
-    await ensureCode(contract.target);
-    const read = new ethers.Contract(contract.target, ABI, rpcProv);
-    const data = await read.getBatch(1, 20);          // READ via RPC langsung
-    renderRows(data);
-    document.getElementById("txStatus").textContent = "Muat batch OK.";
-  } catch (e) {
-    document.getElementById("txStatus").textContent = "Gagal muat: " + (e.shortMessage || e.message || e);
-  }
-}
+        $("txStatus").textContent = "Mengirim transaksi...";
+        const tx = await window.contract.logAttendance(nama, status); // WRITE via MetaMask
+        $("txStatus").textContent = "TX: " + tx.hash + " (waiting...)";
+        const rc = await tx.wait();
+        $("txStatus").textContent = "Mined in block " + rc.blockNumber;
+      } catch (e) {
+        $("txStatus").textContent = "Gagal: " + msg(e);
+      }
+    }
 
+    async function loadBatch() {
+      try {
+        if (!window.contract) return alert("Connect Wallet dulu.");
+        await ensureCode(window.contract.target);
+        const read = new ethers.Contract(window.contract.target, ABI, window.rpcProv); // READ via RPC
+        const data = await read.getBatch(1, 20);
+        renderRows(data);
+        $("txStatus").textContent = "Muat batch OK.";
+      } catch (e) {
+        $("txStatus").textContent = "Gagal muat: " + msg(e);
+      }
+    }
 
+    // ===== Wallet event listeners =====
+    if (window.ethereum) {
+      window.ethereum.on?.("accountsChanged", async () => { try { await rebindSignerAndContract(); } catch {} });
+      window.ethereum.on?.("chainChanged", () => location.reload());
+    }
+
+    // ===== Bind tombol =====
     $("btnConnect").onclick = connect;
+    $("btnChoose").onclick = chooseAccountAgain;
     $("btnLoad").onclick = checkTotal;
     $("btnSubmit").onclick = submit;
     $("btnBatch").onclick = loadBatch;
